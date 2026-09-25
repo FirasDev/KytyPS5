@@ -11,7 +11,6 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
-#include "graphics/host_gpu/renderer/pipeline/pipelineCompileProgress.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -173,9 +172,6 @@ static void Execute(const std::filesystem::path& game_patch) {
 	auto           patch_path = game_patch;
 	Common::Thread guest_thread(
 	    [](void* param) {
-		    // No guest code, module initializers included, runs until the recorded shader set is
-		    // compiled; meanwhile the present thread keeps drawing the panel over a blank frame.
-		    Libs::Graphics::PipelineCompileProgress::WaitForPrecompile();
 		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
 	    },

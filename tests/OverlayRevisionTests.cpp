@@ -1,10 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileProgress.h"
 
-#include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <thread>
 
 namespace {
 
@@ -98,50 +95,12 @@ void CompletedCountNeverPassesTheEstimate() {
     Check(OverlayCompletedOfTotal(progress) == 0, "no estimate leaves nothing to show against");
 }
 
-// The panel belongs to the one phase before the game starts. Shaders the game discovers later are
-// compiled where it asks for them, and must not bring the panel back over a running game.
-void CompilesOutsideThePrecompilePhaseNeverShowThePanel() {
-    // Like a real title: compiles arrive after startup, not on the progress clock's first tick.
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    Progress::ReportCompileStarted();
-    Progress::ReportCompileFinished();
-    Check(!Progress::ShouldShowOverlay(Progress::GetSnapshot()),
-          "an on-demand compile does not show the panel");
-}
-
-// The game thread waits for the recorded set before running any guest code, so nothing (audio,
-// logo movies, game logic) runs behind the panel.
-void GameThreadWaitsForThePrecompilePhase() {
-    Progress::SetEstimatedTotal(3);
-    Progress::SetPrecompiling(true);
-    Check(Progress::ShouldShowOverlay(Progress::GetSnapshot()), "the phase shows the panel");
-
-    std::atomic<bool> released {false};
-    std::thread       game([&] {
-        Progress::WaitForPrecompile();
-        released = true;
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    Check(!released, "the game thread is held while the recorded set compiles");
-
-    Progress::SetPrecompiling(false);
-    game.join();
-    Check(released, "the game thread is released when the phase ends");
-    Check(!Progress::ShouldShowOverlay(Progress::GetSnapshot()), "the panel is gone");
-
-    Progress::WaitForPrecompile(); // no phase: returns at once
-}
-
 } // namespace
 
 int main() {
     ReplayPhaseChangesRevisionEveryStep();
     ColdRunWithoutAnEstimateBehavesTheSame();
     CompletedCountNeverPassesTheEstimate();
-    CompilesOutsideThePrecompilePhaseNeverShowThePanel();
-    GameThreadWaitsForThePrecompilePhase();
     std::printf("OverlayRevisionTests: OK\n");
     return 0;
 }
-
-#include "graphics/host_gpu/renderer/pipeline/pipelineCompileProgress.cpp"

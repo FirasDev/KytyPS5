@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <mutex>
 #include <string>
 
@@ -14,13 +13,17 @@ std::atomic<uint64_t> g_compiled {0};
 std::atomic<uint64_t> g_pending {0};
 std::atomic<uint64_t> g_estimated_total {0};
 std::atomic<uint64_t> g_first_compile_ms {0};
+std::atomic<uint64_t> g_last_compile_ms {0};
 std::atomic<bool>     g_precompiling {false};
-
-std::mutex              g_phase_mutex;
-std::condition_variable g_phase_done;
 
 std::mutex  g_title_mutex;
 std::string g_title;
+
+// A first run has no recorded set, so the precompile phase never happens and the panel would
+// never appear on the one run that actually compiles everything. Fall back to compile activity
+// there. The tail can briefly overlap the game, which is unavoidable: a cold run is the only
+// case where compilation and gameplay genuinely coincide.
+constexpr uint64_t ColdHoldMs = 5000;
 
 const auto g_start = std::chrono::steady_clock::now();
 
@@ -45,6 +48,7 @@ void ReportCompileFinished() {
 	uint64_t   unset = 0;
 	g_first_compile_ms.compare_exchange_strong(unset, now == 0 ? 1 : now,
 	                                           std::memory_order_relaxed);
+	g_last_compile_ms.store(now == 0 ? 1 : now, std::memory_order_relaxed);
 }
 
 void SetEstimatedTotal(uint64_t total) {
@@ -52,16 +56,7 @@ void SetEstimatedTotal(uint64_t total) {
 }
 
 void SetPrecompiling(bool active) {
-	{
-		std::scoped_lock lock(g_phase_mutex);
-		g_precompiling.store(active, std::memory_order_release);
-	}
-	g_phase_done.notify_all();
-}
-
-void WaitForPrecompile() {
-	std::unique_lock lock(g_phase_mutex);
-	g_phase_done.wait(lock, [] { return !g_precompiling.load(std::memory_order_acquire); });
+	g_precompiling.store(active, std::memory_order_release);
 }
 
 void SetTitleName(std::string name) {
@@ -73,14 +68,17 @@ void SetTitleName(std::string name) {
 
 Snapshot GetSnapshot() {
 	const auto first = g_first_compile_ms.load(std::memory_order_relaxed);
+	const auto last  = g_last_compile_ms.load(std::memory_order_relaxed);
 	const auto now   = NowMs();
+	const bool cold  = g_estimated_total.load(std::memory_order_relaxed) == 0;
+	const bool busy  = cold && last != 0 && now - last < ColdHoldMs;
 
 	std::scoped_lock lock(g_title_mutex);
 	return {
 	    .compiled           = g_compiled.load(std::memory_order_relaxed),
 	    .pending            = g_pending.load(std::memory_order_relaxed),
 	    .estimated_total    = g_estimated_total.load(std::memory_order_relaxed),
-	    .compiling          = g_precompiling.load(std::memory_order_acquire),
+	    .compiling          = g_precompiling.load(std::memory_order_acquire) || busy,
 	    .compile_elapsed_ms = first == 0 ? 0 : now - first,
 	    .title              = g_title,
 	};
