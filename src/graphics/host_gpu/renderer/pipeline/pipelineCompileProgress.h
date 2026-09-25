@@ -24,10 +24,13 @@ void ReportCompileFinished();
 void SetEstimatedTotal(uint64_t total);
 void SetTitleName(std::string name);
 
-// True for exactly the span the precompile worker runs. The guest is held at its first shader
-// lookup until it clears, so the panel covers one well-defined phase: it cannot overlap
-// gameplay and cannot flicker between compile bursts the way a rate or activity test would.
+// True for exactly the span the precompile worker runs, and the only thing that shows the panel.
+// The game thread does not start until it clears, so the panel covers one phase before any guest
+// code runs. Shaders the game discovers later compile where it asks for them, with no panel.
 void SetPrecompiling(bool active);
+
+// Blocks until the precompile phase has ended; returns at once when there is none.
+void WaitForPrecompile();
 
 Snapshot GetSnapshot();
 
@@ -43,9 +46,7 @@ inline uint64_t OverlayRevision(const Snapshot& progress) {
 	return progress.compiled * 2 + progress.pending + (ShouldShowOverlay(progress) ? 1 : 0);
 }
 
-// The numerator the panel shows against estimated_total. The estimate comes from the previous
-// run, so this one can overshoot it; clamping keeps the last record at "n / n" instead of
-// tipping the panel back to its no-estimate form for the final frames.
+// The numerator the panel shows against estimated_total, clamped so it never reads past "n / n".
 inline uint64_t OverlayCompletedOfTotal(const Snapshot& progress) {
 	return progress.compiled < progress.estimated_total ? progress.compiled
 	                                                    : progress.estimated_total;

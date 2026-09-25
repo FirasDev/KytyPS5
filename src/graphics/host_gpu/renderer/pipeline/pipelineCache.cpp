@@ -24,7 +24,6 @@
 #include <array>
 #include <atomic>
 #include <cctype>
-#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -86,50 +85,6 @@ std::string PipelineCacheTitleId() {
 		return {};
 	}
 	return title_id;
-}
-
-// A separate small sidecar file, deliberately not folded into the main pipeline cache's own
-// signature-checked binary layout: it's an estimate of how many pipelines this title needs,
-// used to show real progress on the *next* cold rebuild. It stays useful even when the main
-// cache is invalidated (a different build can still need roughly the same number of pipelines),
-// so it must not be gated by, or mixed into the hash of, the data that check invalidates.
-std::filesystem::path CompileCountPath(const std::filesystem::path& driver_cache_path) {
-	auto path = driver_cache_path;
-	path.replace_extension(".count");
-	return path;
-}
-
-uint64_t ReadCompileCountEstimate(const std::filesystem::path& path) {
-	if (!Common::File::IsFileExisting(path)) {
-		return 0;
-	}
-	Common::File file(path, Common::File::Mode::Read);
-	if (file.IsInvalid()) {
-		return 0;
-	}
-	std::string text(static_cast<size_t>(file.Size()), '\0');
-	uint32_t    read = 0;
-	file.Read(text.data(), static_cast<uint32_t>(text.size()), &read);
-	file.Close();
-	text.resize(read);
-	uint64_t value       = 0;
-	const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
-	return ec == std::errc {} ? value : 0;
-}
-
-void WriteCompileCountEstimate(const std::filesystem::path& path, uint64_t count) {
-	if (count == 0) {
-		return;
-	}
-	const auto   text = std::to_string(count);
-	Common::File file;
-	if (!file.Create(path)) {
-		return;
-	}
-	uint32_t written = 0;
-	file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
-	file.Flush();
-	file.Close();
 }
 
 template <typename... Args>
@@ -496,10 +451,6 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
-	// Independent of whether the main cache below validates, and of a dirty local build:
-	// a different build still needs roughly the number of pipelines the last run did.
-	PipelineCompileProgress::SetEstimatedTotal(
-	    ReadCompileCountEstimate(CompileCountPath(m_driver_cache_path)));
 
 	{
 		const auto shader_set =
@@ -511,6 +462,7 @@ void PipelineCache::InitializeDriverCache() {
 		auto records = ShaderPrecompile::Load(shader_set, KYTY_GIT_REVISION);
 		ShaderPrecompile::Open(shader_set, KYTY_GIT_REVISION, !records.empty());
 		if (!records.empty()) {
+			PipelineCompileProgress::SetEstimatedTotal(records.size());
 			PipelineCompileProgress::SetPrecompiling(true);
 			m_precompile_done.store(false, std::memory_order_release);
 			m_precompile_thread = std::jthread([this, records = std::move(records)]() mutable {
@@ -521,9 +473,6 @@ void PipelineCache::InitializeDriverCache() {
 
 	if (git_hash.ends_with("-dirty")) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		// A dirty build loads no cache, so this run compiles everything the title needs and
-		// its count is a valid estimate for the next one.
-		m_cache_was_cold = true;
 		return;
 	}
 	const auto path         = Common::PathToString(m_driver_cache_path);
@@ -565,10 +514,6 @@ void PipelineCache::InitializeDriverCache() {
 			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
 		}
 	}
-	// Only a genuine cold start (no usable prior data) means "compiled this run" will end up
-	// counting everything the title needs; a warm run that hits just one or two incidental new
-	// shaders must not overwrite a good prior estimate with that small number in Save() below.
-	m_cache_was_cold = initial_data.empty();
 
 	vk::PipelineCacheCreateInfo create {};
 	create.initialDataSize = initial_data.size();
@@ -597,8 +542,9 @@ void PipelineCache::InitializeDriverCache() {
 
 // Replays the set recorded by a previous run. One thread is enough: the whole compile workload
 // for this title measures around a second of CPU, so a pool would add contention for nothing.
-// Held by the guest's first shader lookup so the title cannot draw before the recorded set is
-// in place. This is what keeps the loading panel to exactly one phase.
+// The game thread is held before any guest code runs (PipelineCompileProgress::
+// WaitForPrecompile), so the lookup-side calls below only guard the invariant; the destructor
+// relies on this to join the thread.
 void PipelineCache::WaitForPrecompile() {
 	if (m_precompile_done.load(std::memory_order_acquire)) {
 		return;
@@ -611,8 +557,6 @@ void PipelineCache::WaitForPrecompile() {
 }
 
 void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationRecord> records) {
-	PipelineCompileProgress::SetEstimatedTotal(records.size());
-
 	for (const auto& record: records) {
 		ShaderParams params {};
 		if (record.user_data.size() > params.user_data.size()) {
@@ -684,13 +628,6 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 void PipelineCache::Save() {
 	ShaderPrecompile::Close();
 	Common::LockGuard lock(m_mutex);
-	if (m_cache_was_cold) {
-		// The estimate is written even when no driver cache exists, so the directory the
-		// main save path creates below may not be there yet.
-		Common::File::CreateDirectories(m_driver_cache_path.parent_path());
-		WriteCompileCountEstimate(CompileCountPath(m_driver_cache_path),
-		                          PipelineCompileProgress::GetSnapshot().compiled);
-	}
 	if (m_driver_cache == nullptr) {
 		return;
 	}
